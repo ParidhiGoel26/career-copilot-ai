@@ -1,3 +1,6 @@
+from utils.llm_config import get_model
+
+
 def optimize_resume(client, original_resume, job_description):
     prompt = f"""
 You are an expert resume optimizer.
@@ -27,7 +30,7 @@ Slightly optimize the user's uploaded resume to match the provided job descripti
 """
 
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model=get_model(),
         messages=[{"role": "user", "content": prompt}],
     )
     return response.choices[0].message.content.strip()

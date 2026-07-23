@@ -2,6 +2,7 @@ import os
 
 from utils.pdf_utils import extract_text_from_pdf
 from utils.rag import UserKnowledgeBase
+from utils.session_store import load_text
 
 
 def _mock_github_profile(username):
@@ -24,21 +25,26 @@ Weak topics: Graph algorithms, Advanced DP, System design
 Recent activity: 12 problems solved in the last 30 days"""
 
 
-def build_knowledge_base(session, upload_folder):
+def build_knowledge_base(session, upload_folder, user_id=None):
     kb = UserKnowledgeBase()
 
     filename = session.get("resume_filename")
     if filename:
-        path = os.path.join(upload_folder, filename)
-        if os.path.exists(path):
-            resume_text = extract_text_from_pdf(path)
-            kb.add_document("resume", resume_text, "Uploaded Resume")
+        paths = []
+        if user_id:
+            paths.append(os.path.join(upload_folder, "users", user_id, filename))
+        paths.append(os.path.join(upload_folder, filename))
+        for path in paths:
+            if os.path.exists(path):
+                resume_text = extract_text_from_pdf(path)
+                kb.add_document("resume", resume_text, "Uploaded Resume")
+                break
 
-    jd = session.get("jd")
+    jd = load_text(upload_folder, "jd", "") or session.get("jd")
     if jd:
         kb.add_document("job_description", jd, "Job Description")
 
-    optimized = session.get("optimized_resume")
+    optimized = load_text(upload_folder, "optimized_resume", "") or session.get("optimized_resume")
     if optimized:
         kb.add_document("optimized_resume", optimized, "Previous Optimization")
 

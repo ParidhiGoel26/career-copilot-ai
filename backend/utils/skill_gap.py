@@ -1,5 +1,7 @@
 import json
 
+from utils.llm_config import get_model
+
 
 def analyze_skill_gap(client, resume_text, job_description):
     prompt = f"""You are a career analyst comparing a candidate's resume against a job description.
@@ -27,7 +29,7 @@ Resume:
 """
 
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model=get_model(),
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
     )

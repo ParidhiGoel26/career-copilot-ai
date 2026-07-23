@@ -1,5 +1,7 @@
 import json
 
+from utils.llm_config import get_model
+
 
 def simulate_recruiter_review(client, resume_text, job_description):
     prompt = f"""You are an experienced technical recruiter reviewing a candidate's resume for a specific role.
@@ -29,7 +31,7 @@ Resume:
 """
 
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model=get_model(),
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
     )

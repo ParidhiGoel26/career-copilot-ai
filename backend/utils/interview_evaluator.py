@@ -1,5 +1,7 @@
 import json
 
+from utils.llm_config import get_model
+
 
 def evaluate_answer(client, question, answer, question_type):
     prompt = f"""You are an expert interview coach evaluating a candidate's answer.
@@ -32,7 +34,7 @@ Return ONLY valid JSON:
 """
 
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model=get_model(),
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
     )

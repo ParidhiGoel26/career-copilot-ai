@@ -1,5 +1,7 @@
 import re
 
+from utils.llm_config import get_model
+
 
 TONE_GUIDES = {
     "professional": "Formal, polished, and confident. Traditional business letter structure.",
@@ -98,7 +100,7 @@ Resume:
 """
 
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model=get_model(),
         messages=[{"role": "user", "content": prompt}],
     )
     return response.choices[0].message.content.strip()

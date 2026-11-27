@@ -1,0 +1,27 @@
+{% extends "auth_layout.html" %}
+
+{% block title %}Register — Career AI{% endblock %}
+{% block subtitle %}Create your Career AI account{% endblock %}
+
+{% block content %}
+{% if error %}
+<div class="alert alert-warning" style="margin-bottom:16px;">{{ error }}</div>
+{% endif %}
+
+<form class="auth-form" method="POST" action="{{ url_for('auth_register') }}">
+  <label for="name">Name</label>
+  <input type="text" id="name" name="name" autocomplete="name" placeholder="Your name">
+
+  <label for="email">Email</label>
+  <input type="email" id="email" name="email" required autocomplete="email" placeholder="you@example.com">
+
+  <label for="password">Password</label>
+  <input type="password" id="password" name="password" required autocomplete="new-password" placeholder="At least 6 characters" minlength="6">
+
+  <button type="submit" class="btn btn-primary" style="width:100%;">Create Account</button>
+</form>
+
+<div class="auth-footer">
+  Already have an account? <a href="{{ url_for('login') }}">Sign in</a>
+</div>
+{% endblock %}

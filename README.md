@@ -17,7 +17,7 @@ Most tools share resume and JD data from the Resume Optimizer flow. Complete tha
 
 ### Resume Optimizer
 - PDF resume upload and text extraction
-- AI content optimization (OpenAI GPT)
+- AI content optimization (Groq LLMs)
 - Side-by-side diff of original vs optimized resume
 - ATS keyword scoring
 - Download optimized resume as PDF
@@ -44,7 +44,11 @@ Most tools share resume and JD data from the Resume Optimizer flow. Complete tha
 
 ## Tech Stack
 
-- **Backend:** Python 3, Flask, OpenAI API
+- **Backend:** Python 3, Flask, Groq API (OpenAI-compatible client)
+- **Storage:** JSON files by default; SQLAlchemy (SQLite / Postgres) behind `USE_DATABASE`
+- **RAG:** TF-IDF by default; embedding retrieval (cached in DB) behind `USE_EMBEDDINGS`
+- **Async jobs:** thread pool or Redis + RQ behind `USE_ASYNC_JOBS`
+- **Ops:** `/health`, `/ready`, `/metrics`, request-id logging, Dockerfile / docker-compose, pytest suite
 - **Frontend:** Jinja2 templates, HTML/CSS
 - **PDF:** pdfplumber (parsing), ReportLab (export)
 
@@ -77,7 +81,7 @@ resume_optimizer/
 ## Prerequisites
 
 - Python 3.10+
-- An [OpenAI API key](https://platform.openai.com/api-keys) (or use demo mode)
+- A [Groq API key](https://console.groq.com/keys) (or use demo mode)
 
 ## Setup
 
@@ -97,10 +101,13 @@ resume_optimizer/
    ```
 
    ```env
-   OPENAI_API_KEY=your_openai_api_key_here
+   GROQ_API_KEY=your_groq_api_key_here
    FLASK_SECRET_KEY=your_random_secret_key_here
 
-   # Set to true to run the full UI without OpenAI API credits
+   # Optional model override (default: llama-3.3-70b-versatile)
+   # GROQ_MODEL=llama-3.1-8b-instant
+
+   # Set to true to run the full UI without Groq API credits
    DEMO_MODE=true
    ```
 
@@ -143,11 +150,26 @@ resume_optimizer/
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENAI_API_KEY` | Yes* | OpenAI API key for live AI features |
+| `GROQ_API_KEY` | Yes* | Groq API key for live AI features (`GROQ_KEY` also accepted) |
+| `GROQ_MODEL` | No | Model id (default: `llama-3.3-70b-versatile`) |
 | `FLASK_SECRET_KEY` | No | Flask session secret (defaults to a dev value) |
 | `DEMO_MODE` | No | `true` to enable mock AI responses |
+| `USE_DATABASE` | No | `true` to store users/history in SQL (`DATABASE_URL`, default SQLite `backend/data/career_ai.db`) |
+| `USE_EMBEDDINGS` | No | `true` to use embedding similarity for RAG (`EMBEDDING_PROVIDER=hashing\|api`) |
+| `USE_ASYNC_JOBS` | No | `true` to return `202 + job_id` for coach / cover letter / email; poll `GET /jobs/<id>` |
+| `JOB_BACKEND` | No | `memory` (default) or `redis` |
+| `REDIS_URL` | No | Redis URL for the `redis` job backend |
 
 \*Not required when `DEMO_MODE=true`.
+
+## Testing
+
+```bash
+cd backend
+..\venv\Scripts\python.exe -m pytest tests -q
+```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the request flow, data model and deployment notes.
 
 ## Troubleshooting
 
@@ -174,13 +196,12 @@ Restart with a single instance:
 .\venv\Scripts\python.exe backend\app.py
 ```
 
-**OpenAI quota / rate limit errors**  
-Set `DEMO_MODE=true` in `.env` and restart the server.
+**Groq rate limit errors**  
+Wait a moment and retry, or set `DEMO_MODE=true` in `.env` and restart the server.
 
 ## Roadmap
 
 - Integrations (LinkedIn, Indeed, etc.)
-- Settings page
 - Live GitHub / LeetCode API integration
 - Voice recording for interview answers
 

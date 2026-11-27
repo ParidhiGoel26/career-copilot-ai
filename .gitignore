@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 backend/uploads/*
 !backend/uploads/.gitkeep
+backend/data/users.json
+backend/data/user_activity/*
+!backend/data/.gitkeep
+backend/data/*.db

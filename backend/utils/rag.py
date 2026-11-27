@@ -2,6 +2,8 @@ import math
 import re
 from collections import Counter
 
+from utils.feature_flags import use_embeddings
+
 
 def _tokenize(text):
     return re.findall(r"\b[a-zA-Z]{3,}\b", text.lower())
@@ -39,10 +41,18 @@ def _chunk_text(text, source, chunk_size=400, overlap=80):
 
 
 class UserKnowledgeBase:
-    def __init__(self):
+    def __init__(self, embedder=None):
         self.chunks = []
         self.documents = {}
         self._idf = {}
+        self._embedder = embedder
+
+    def _get_embedder(self):
+        if self._embedder is None:
+            from utils.embeddings import get_embedder
+
+            self._embedder = get_embedder()
+        return self._embedder
 
     def add_document(self, source, content, label=None):
         if not content or not str(content).strip():
@@ -51,7 +61,31 @@ class UserKnowledgeBase:
             "label": label or source,
             "content": content,
         }
-        self.chunks.extend(_chunk_text(str(content), source))
+        new_chunks = _chunk_text(str(content), source)
+        if new_chunks and use_embeddings():
+            vectors = self._get_embedder().embed_documents([c["text"] for c in new_chunks])
+            for chunk, vector in zip(new_chunks, vectors):
+                chunk["embedding"] = vector
+        self.chunks.extend(new_chunks)
+        self._idf = {}
+
+    def add_embedded_document(self, source, content, label, chunks):
+        """Add a document whose chunks already carry embeddings (e.g. from DB cache)."""
+        if not content or not str(content).strip():
+            return
+        self.documents[source] = {
+            "label": label or source,
+            "content": content,
+        }
+        self.chunks.extend(
+            {
+                "id": c.get("id"),
+                "source": source,
+                "text": c["text"],
+                "embedding": c.get("embedding") or [],
+            }
+            for c in chunks
+        )
         self._idf = {}
 
     def _compute_idf(self):
@@ -65,9 +99,35 @@ class UserKnowledgeBase:
         n = len(self.chunks) or 1
         self._idf = {term: math.log((n + 1) / (freq + 1)) + 1 for term, freq in doc_freq.items()}
 
+    def _retrieve_embedding(self, query, top_k):
+        from utils.embeddings import cosine_similarity
+
+        query_vec = self._get_embedder().embed_query(query)
+        scored = []
+        for chunk in self.chunks:
+            vec = chunk.get("embedding")
+            if not vec:
+                continue
+            score = cosine_similarity(query_vec, vec)
+            if score > 0:
+                scored.append((score, chunk))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [
+            {
+                "source": chunk["source"],
+                "label": self.documents.get(chunk["source"], {}).get("label", chunk["source"]),
+                "text": chunk["text"],
+                "score": round(score, 4),
+            }
+            for score, chunk in scored[:top_k]
+        ]
+
     def retrieve(self, query, top_k=5):
         if not self.chunks:
             return []
+
+        if use_embeddings() and any(c.get("embedding") for c in self.chunks):
+            return self._retrieve_embedding(query, top_k)
 
         self._compute_idf()
         query_terms = _tokenize(query)

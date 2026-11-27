@@ -1,3 +1,6 @@
+from utils.llm_config import get_model
+
+
 def _format_context(retrieved):
     if not retrieved:
         return "No relevant document excerpts found."
@@ -37,7 +40,7 @@ Respond in a helpful, conversational tone. Use bullet points when listing projec
 Keep response under 250 words unless a detailed comparison is needed."""
 
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model=get_model(),
         messages=[{"role": "user", "content": prompt}],
     )
     reply = response.choices[0].message.content.strip()

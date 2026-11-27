@@ -87,9 +87,9 @@ body {
 }
 
 .nav-item.active {
-  background: rgba(37, 99, 235, 0.25);
+  background: rgba(13, 148, 136, 0.22);
   color: #fff;
-  box-shadow: inset 3px 0 0 #3b82f6;
+  box-shadow: inset 3px 0 0 #2dd4bf;
 }
 
 .nav-item.disabled {

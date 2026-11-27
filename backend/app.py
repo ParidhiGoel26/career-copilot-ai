@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from flask import Flask, render_template, request, redirect, url_for, session, send_file, jsonify
+from flask import Flask, render_template, request, redirect, url_for, session, send_file, jsonify, g, make_response
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -27,6 +27,40 @@ from utils.interview_evaluator import evaluate_answer
 from utils.interview_report import mock_evaluate_answer, generate_interview_report
 from utils.cover_letter import generate_cover_letter, mock_cover_letter
 from utils.email_generator import generate_email, mock_email
+from utils.llm_config import GROQ_BASE_URL
+from utils.session_store import (
+    save_json,
+    load_json,
+    save_text,
+    load_text,
+    delete_blob,
+    get_store_id,
+)
+from utils.feature_flags import use_async_jobs, use_database
+from utils.jobs import get_job_manager
+from utils.observability import register_observability
+from utils import metrics as app_metrics
+from utils.auth import (
+    TOKEN_COOKIE,
+    TOKEN_HOURS,
+    authenticate_user,
+    create_access_token,
+    create_user,
+    ensure_default_user,
+    register_auth_hooks,
+)
+from utils.user_data import (
+    save_resume_record,
+    log_job_search,
+    update_job_search,
+    log_coach_query,
+    get_user_history,
+    find_resume,
+    find_search,
+    store_uploaded_file,
+    delete_resume,
+    delete_search,
+)
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
@@ -34,17 +68,19 @@ FRONTEND_DIR = PROJECT_ROOT / "frontend"
 
 load_dotenv(PROJECT_ROOT / ".env")
 DEMO_MODE = os.getenv("DEMO_MODE", "").lower() in ("1", "true", "yes")
-api_key = os.getenv("OPENAI_API_KEY")
+api_key = os.getenv("GROQ_API_KEY") or os.getenv("GROQ_KEY")
 
 if not DEMO_MODE and not api_key:
     raise RuntimeError(
-        "OPENAI_API_KEY is not set. Create a .env file in the project root "
-        f"({PROJECT_ROOT / '.env'}) with your OpenAI API key, "
+        "GROQ_API_KEY (or GROQ_KEY) is not set. Create a .env file in the project root "
+        f"({PROJECT_ROOT / '.env'}) with your Groq API key, "
         "or set DEMO_MODE=true to test without API credits. "
         "See .env.example for the format."
     )
 
-client = OpenAI(api_key=api_key) if api_key else None
+client = (
+    OpenAI(api_key=api_key, base_url=GROQ_BASE_URL) if api_key else None
+)
 
 app = Flask(
     __name__,
@@ -56,8 +92,172 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", "supersecretkey")
 app.config["UPLOAD_FOLDER"] = str(BACKEND_DIR / "uploads")
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
+ensure_default_user()
+register_auth_hooks(app)
+register_observability(app)
+
+
+def _set_auth_cookie(response, token: str):
+    response.set_cookie(
+        TOKEN_COOKIE,
+        token,
+        httponly=True,
+        samesite="Lax",
+        max_age=TOKEN_HOURS * 3600,
+    )
+    return response
+
+
+def _clear_auth_cookie(response):
+    response.set_cookie(TOKEN_COOKIE, "", expires=0, httponly=True, samesite="Lax")
+    return response
+
+
+def _uploads():
+    return app.config["UPLOAD_FOLDER"]
+
+
+def _user_id():
+    user = getattr(g, "current_user", None)
+    return user["id"] if user else None
+
+
+def _user_upload_dir():
+    uid = _user_id()
+    if not uid:
+        return _uploads()
+    path = os.path.join(_uploads(), "users", uid)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _resume_disk_path(filename=None):
+    fname = filename or session.get("resume_filename")
+    if not fname:
+        return None
+    user_path = os.path.join(_user_upload_dir(), fname)
+    if os.path.exists(user_path):
+        return user_path
+    legacy = os.path.join(_uploads(), fname)
+    if os.path.exists(legacy):
+        return legacy
+    return user_path
+
+
+def _save_user_resume(file_storage):
+    original = secure_filename(file_storage.filename) or "resume.pdf"
+    stored, _ = store_uploaded_file(file_storage, _user_upload_dir(), original)
+    record = save_resume_record(_user_id(), stored, original)
+    session["resume_filename"] = stored
+    session["resume_id"] = record["id"]
+    session.modified = True
+    return stored, record
+
+
+def _set_jd(text):
+    save_text(_uploads(), "jd", text or "")
+    session.pop("jd", None)
+    session["has_jd"] = bool(text and str(text).strip())
+    session.modified = True
+
+
+def _get_jd():
+    text = load_text(_uploads(), "jd", "")
+    if text:
+        return text
+    legacy = session.pop("jd", None)
+    if legacy:
+        _set_jd(legacy)
+        return legacy
+    return ""
+
+
+def _set_optimized_resume(text):
+    save_text(_uploads(), "optimized_resume", text or "")
+    session.pop("optimized_resume", None)
+    session["has_optimized_resume"] = bool(text)
+    session.modified = True
+
+
+def _get_optimized_resume():
+    text = load_text(_uploads(), "optimized_resume", "")
+    if text:
+        return text
+    legacy = session.pop("optimized_resume", None)
+    if legacy:
+        _set_optimized_resume(legacy)
+        return legacy
+    return ""
+
+
+def _set_interview(data):
+    if data is None:
+        delete_blob(_uploads(), "interview")
+        session.pop("interview", None)
+        session.pop("has_interview", None)
+    else:
+        save_json(_uploads(), "interview", data)
+        session.pop("interview", None)
+        session["has_interview"] = True
+    session.modified = True
+
+
+def _get_interview():
+    data = load_json(_uploads(), "interview", None)
+    if data is not None:
+        return data
+    legacy = session.pop("interview", None)
+    if legacy is not None:
+        _set_interview(legacy)
+        return legacy
+    return None
+
+
+def _set_coach_chat(history):
+    save_json(_uploads(), "coach_chat", history or [])
+    session.pop("coach_chat", None)
+    session.modified = True
+
+
+def _get_coach_chat():
+    data = load_json(_uploads(), "coach_chat", None)
+    if data is not None:
+        return data
+    legacy = session.pop("coach_chat", None)
+    if legacy is not None:
+        _set_coach_chat(legacy)
+        return legacy
+    return []
+
+
+def _set_document(name, data):
+    save_json(_uploads(), name, data)
+    session.pop(name, None)
+    session.modified = True
+
+
+def _get_document(name, default=None):
+    data = load_json(_uploads(), name, None)
+    if data is not None:
+        return data
+    legacy = session.pop(name, None)
+    if legacy is not None:
+        _set_document(name, legacy)
+        return legacy
+    return default
+
+
 NAV_MAP = {
     "dashboard": "dashboard",
+    "health": "",
+    "ready": "",
+    "metrics": "",
+    "job_status": "",
+    "login": "",
+    "register": "",
+    "auth_login": "",
+    "auth_register": "",
+    "auth_logout": "",
     "index": "resume_optimizer",
     "jobdesc": "resume_optimizer",
     "result": "resume_optimizer",
@@ -71,6 +271,11 @@ NAV_MAP = {
     "documents_cover_letter": "documents",
     "documents_email": "documents",
     "documents_download": "documents",
+    "history": "history",
+    "history_load_resume": "history",
+    "history_load_search": "history",
+    "history_delete_resume": "history",
+    "history_delete_search": "history",
 }
 
 
@@ -79,7 +284,129 @@ def inject_nav():
     return {
         "active_nav": NAV_MAP.get(request.endpoint, ""),
         "demo_mode": DEMO_MODE,
+        "current_user": getattr(g, "current_user", None),
     }
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+@app.route("/ready")
+def ready():
+    checks = {"database": "skipped"}
+    if use_database():
+        try:
+            from sqlalchemy import text
+            from utils.db import get_session
+
+            db = get_session()
+            try:
+                db.execute(text("SELECT 1"))
+            finally:
+                db.close()
+            checks["database"] = "ok"
+        except Exception as exc:
+            return jsonify({"status": "not_ready", "checks": {"database": str(exc)}}), 503
+    return jsonify({"status": "ready", "checks": checks})
+
+
+@app.route("/metrics")
+def metrics():
+    return jsonify(app_metrics.snapshot())
+
+
+@app.route("/jobs/<job_id>")
+def job_status(job_id):
+    job = get_job_manager().get(job_id, user_id=_user_id())
+    if not job:
+        return jsonify({"error": "Job not found."}), 404
+    return jsonify(job.to_dict())
+
+
+@app.route("/login")
+def login():
+    if getattr(g, "current_user", None):
+        return redirect(url_for("dashboard"))
+    return render_template(
+        "login.html",
+        error=request.args.get("error"),
+        next_url=request.args.get("next", ""),
+    )
+
+
+@app.route("/register")
+def register():
+    if getattr(g, "current_user", None):
+        return redirect(url_for("dashboard"))
+    return render_template("register.html", error=request.args.get("error"))
+
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        email = data.get("email", "")
+        password = data.get("password", "")
+    else:
+        email = request.form.get("email", "")
+        password = request.form.get("password", "")
+
+    user = authenticate_user(email, password)
+    if not user:
+        if request.is_json:
+            return jsonify({"error": "Invalid email or password."}), 401
+        return redirect(url_for("login", error="Invalid email or password."))
+
+    token = create_access_token(user)
+    next_url = (
+        (request.get_json(silent=True) or {}).get("next")
+        or request.form.get("next")
+        or url_for("dashboard")
+    )
+
+    if request.is_json:
+        resp = make_response(jsonify({"ok": True, "token": token, "user": user}))
+    else:
+        resp = make_response(redirect(next_url))
+
+    return _set_auth_cookie(resp, token)
+
+
+@app.route("/auth/register", methods=["POST"])
+def auth_register():
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        email = data.get("email", "")
+        password = data.get("password", "")
+        name = data.get("name", "")
+    else:
+        email = request.form.get("email", "")
+        password = request.form.get("password", "")
+        name = request.form.get("name", "")
+
+    try:
+        user = create_user(email, password, name)
+    except ValueError as exc:
+        if request.is_json:
+            return jsonify({"error": str(exc)}), 400
+        return redirect(url_for("register", error=str(exc)))
+
+    token = create_access_token(user)
+
+    if request.is_json:
+        resp = make_response(jsonify({"ok": True, "token": token, "user": user}))
+    else:
+        resp = make_response(redirect(url_for("dashboard")))
+
+    return _set_auth_cookie(resp, token)
+
+
+@app.route("/auth/logout", methods=["POST", "GET"])
+def auth_logout():
+    resp = make_response(redirect(url_for("login")))
+    return _clear_auth_cookie(resp)
 
 
 @app.route("/dashboard")
@@ -106,11 +433,7 @@ def index():
     if request.method == "POST":
         resume = request.files["resume"]
         if resume and resume.filename.endswith(".pdf"):
-            filename = secure_filename(resume.filename)
-            resume_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-            resume.save(resume_path)
-
-            session["resume_filename"] = filename
+            _save_user_resume(resume)
             return redirect(url_for("jobdesc"))
     return render_template("index.html")
 
@@ -119,18 +442,28 @@ def index():
 def jobdesc():
     if request.method == "POST":
         jd_text = request.form["jd"]
-        session["jd"] = jd_text
+        _set_jd(jd_text)
+        search = log_job_search(
+            _user_id(),
+            jd_text,
+            resume_id=session.get("resume_id"),
+            tool="resume_optimizer",
+        )
+        session["search_id"] = search["id"]
+        session.modified = True
         return redirect(url_for("result", filename=session.get("resume_filename")))
     return render_template("jd.html")
 
 
 @app.route("/result")
 def result():
-    filename = request.args.get("filename")
-    resume_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+    filename = request.args.get("filename") or session.get("resume_filename")
+    resume_path = _resume_disk_path(filename)
+    if not resume_path or not os.path.exists(resume_path):
+        return redirect(url_for("index"))
 
     original_resume = extract_text_from_pdf(resume_path)
-    job_description = session.get("jd", "")
+    job_description = _get_jd()
 
     api_errors = []
     optimization_failed = False
@@ -147,7 +480,7 @@ def result():
         if message not in api_errors:
             api_errors.append(message)
 
-    session["optimized_resume"] = optimized_resume
+    _set_optimized_resume(optimized_resume)
 
     recruiter_review = None
     try:
@@ -163,6 +496,15 @@ def result():
     ats_score, matched_keywords = calculate_ats_score(optimized_resume, job_description)
     added_keywords = find_added_keywords(original_resume, optimized_resume)
     diff_html = get_diff_html(original_resume, optimized_resume)
+
+    search_id = session.get("search_id")
+    if search_id:
+        update_job_search(
+            _user_id(),
+            search_id,
+            ats_score=ats_score,
+            optimized=True,
+        )
 
     return render_template(
         "result.html",
@@ -181,7 +523,7 @@ def result():
 
 @app.route("/download")
 def download_pdf():
-    optimized_resume = session.get("optimized_resume", "")
+    optimized_resume = _get_optimized_resume()
     output_path = os.path.join(app.config["UPLOAD_FOLDER"], "optimized_resume.pdf")
     generate_pdf(optimized_resume, output_path)
     return send_file(output_path, as_attachment=True)
@@ -190,11 +532,11 @@ def download_pdf():
 def _load_resume_and_jd(use_session=False, uploaded_file=None, jd_text=""):
     if use_session:
         filename = session.get("resume_filename")
-        jd = session.get("jd", "")
+        jd = _get_jd()
         if not filename or not jd:
             return None, None, "No resume or job description found from Resume Optimizer."
-        resume_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-        if not os.path.exists(resume_path):
+        resume_path = _resume_disk_path(filename)
+        if not resume_path or not os.path.exists(resume_path):
             return None, None, "Uploaded resume file not found. Please upload again."
         return extract_text_from_pdf(resume_path), jd, None
 
@@ -204,18 +546,31 @@ def _load_resume_and_jd(use_session=False, uploaded_file=None, jd_text=""):
 
     has_new_file = uploaded_file and uploaded_file.filename.endswith(".pdf")
     if has_new_file:
-        filename = secure_filename(uploaded_file.filename)
-        resume_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-        uploaded_file.save(resume_path)
-        session["resume_filename"] = filename
-        session["jd"] = jd
-        return extract_text_from_pdf(resume_path), jd, None
+        _save_user_resume(uploaded_file)
+        _set_jd(jd)
+        search = log_job_search(
+            _user_id(),
+            jd,
+            resume_id=session.get("resume_id"),
+            tool="analysis",
+        )
+        session["search_id"] = search["id"]
+        session.modified = True
+        return extract_text_from_pdf(_resume_disk_path()), jd, None
 
     filename = session.get("resume_filename")
     if filename:
-        resume_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-        if os.path.exists(resume_path):
-            session["jd"] = jd
+        resume_path = _resume_disk_path(filename)
+        if resume_path and os.path.exists(resume_path):
+            _set_jd(jd)
+            search = log_job_search(
+                _user_id(),
+                jd,
+                resume_id=session.get("resume_id"),
+                tool="analysis",
+            )
+            session["search_id"] = search["id"]
+            session.modified = True
             return extract_text_from_pdf(resume_path), jd, None
 
     return None, None, "Please upload a valid PDF resume."
@@ -223,8 +578,8 @@ def _load_resume_and_jd(use_session=False, uploaded_file=None, jd_text=""):
 
 @app.route("/analysis", methods=["GET", "POST"])
 def analysis():
-    has_session = bool(session.get("resume_filename") and session.get("jd"))
-    session_jd = session.get("jd", "")
+    has_session = bool(session.get("resume_filename") and _get_jd())
+    session_jd = _get_jd()
     api_errors = []
     results = None
     form_error = None
@@ -276,6 +631,26 @@ def analysis():
             "recruiter_review": recruiter_review,
         }
 
+        search_id = session.get("search_id")
+        readiness = skill_gap.get("readiness_score") if skill_gap else None
+        if search_id:
+            update_job_search(
+                _user_id(),
+                search_id,
+                ats_score=ats_score,
+                readiness_score=readiness,
+            )
+        else:
+            search = log_job_search(
+                _user_id(),
+                jd_text,
+                resume_id=session.get("resume_id"),
+                tool="analysis",
+                extra={"ats_score": ats_score, "readiness_score": readiness},
+            )
+            session["search_id"] = search["id"]
+            session.modified = True
+
     return render_template(
         "analysis.html",
         results=results,
@@ -287,9 +662,9 @@ def analysis():
 
 
 def _get_coach_context():
-    kb = build_knowledge_base(session, app.config["UPLOAD_FOLDER"])
+    kb = build_knowledge_base(session, app.config["UPLOAD_FOLDER"], user_id=_user_id())
     sources = kb.list_sources()
-    chat_history = session.get("coach_chat", [])
+    chat_history = _get_coach_chat()
     return kb, sources, chat_history
 
 
@@ -314,6 +689,25 @@ def career_coach_chat_api():
     if not message:
         return jsonify({"error": "Message is required."}), 400
 
+    log_coach_query(_user_id(), message)
+
+    if use_async_jobs():
+        payload = {
+            "message": message,
+            "upload_folder": app.config["UPLOAD_FOLDER"],
+            "store_id": get_store_id(),
+            "user_id": _user_id(),
+            "demo_mode": DEMO_MODE,
+            "chat_history": _get_coach_chat(),
+            "session_data": {
+                "resume_filename": session.get("resume_filename"),
+                "github_username": session.get("github_username"),
+                "leetcode_username": session.get("leetcode_username"),
+            },
+        }
+        job_id = get_job_manager().submit("career_coach", payload, user_id=_user_id())
+        return jsonify({"job_id": job_id, "status": "queued"}), 202
+
     kb, _, chat_history = _get_coach_context()
     retrieved = kb.retrieve(message, top_k=6)
     api_error = None
@@ -334,7 +728,7 @@ def career_coach_chat_api():
         "sources": sources,
     }
     chat_history = chat_history + [turn]
-    session["coach_chat"] = chat_history[-20:]
+    _set_coach_chat(chat_history[-6:])
 
     return jsonify({
         "reply": reply,
@@ -372,37 +766,86 @@ def career_coach_connect():
 
 @app.route("/career-coach/clear", methods=["POST"])
 def career_coach_clear():
-    session["coach_chat"] = []
+    _set_coach_chat([])
     return jsonify({"ok": True})
 
 
 def _get_resume_text():
-    filename = session.get("resume_filename")
-    if not filename:
-        return ""
-    path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-    if not os.path.exists(path):
+    path = _resume_disk_path()
+    if not path or not os.path.exists(path):
         return ""
     return extract_text_from_pdf(path)
 
 
+@app.route("/history")
+def history():
+    profile = get_user_history(_user_id())
+    return render_template("history.html", history=profile)
+
+
+@app.route("/history/load-resume/<resume_id>", methods=["POST"])
+def history_load_resume(resume_id):
+    record = find_resume(_user_id(), resume_id)
+    if not record:
+        return redirect(url_for("history"))
+    session["resume_filename"] = record["stored_filename"]
+    session["resume_id"] = record["id"]
+    session.modified = True
+    return redirect(url_for("jobdesc"))
+
+
+@app.route("/history/load-search/<search_id>", methods=["POST"])
+def history_load_search(search_id):
+    record = find_search(_user_id(), search_id)
+    if not record:
+        return redirect(url_for("history"))
+    _set_jd(record.get("jd_text", ""))
+    session["search_id"] = record["id"]
+    if record.get("resume_id"):
+        resume = find_resume(_user_id(), record["resume_id"])
+        if resume:
+            session["resume_filename"] = resume["stored_filename"]
+            session["resume_id"] = resume["id"]
+    session.modified = True
+    return redirect(url_for("analysis"))
+
+
+@app.route("/history/delete-resume/<resume_id>", methods=["POST"])
+def history_delete_resume(resume_id):
+    if delete_resume(_user_id(), resume_id, _user_upload_dir()):
+        if session.get("resume_id") == resume_id:
+            session.pop("resume_filename", None)
+            session.pop("resume_id", None)
+            session.modified = True
+    return redirect(url_for("history"))
+
+
+@app.route("/history/delete-search/<search_id>", methods=["POST"])
+def history_delete_search(search_id):
+    if delete_search(_user_id(), search_id):
+        if session.get("search_id") == search_id:
+            session.pop("search_id", None)
+            session.modified = True
+    return redirect(url_for("history"))
+
+
 @app.route("/interview-prep")
 def interview_prep():
-    interview = session.get("interview")
-    has_data = bool(session.get("resume_filename") or session.get("jd"))
+    interview = _get_interview()
+    has_data = bool(session.get("resume_filename") or _get_jd())
     return render_template(
         "interview_prep.html",
         interview=interview,
         has_data=has_data,
         has_resume=bool(session.get("resume_filename")),
-        has_jd=bool(session.get("jd")),
+        has_jd=bool(_get_jd()),
     )
 
 
 @app.route("/interview-prep/start", methods=["POST"])
 def interview_prep_start():
     resume_text = _get_resume_text()
-    jd_text = session.get("jd", "")
+    jd_text = _get_jd()
 
     if not resume_text and not jd_text:
         return jsonify({
@@ -410,13 +853,12 @@ def interview_prep_start():
         }), 400
 
     questions = build_interview_session(resume_text, jd_text)
-    session["interview"] = {
+    _set_interview({
         "questions": questions,
         "current_index": 0,
         "answers": [],
         "report": None,
-    }
-    session.modified = True
+    })
 
     return jsonify({
         "total": len(questions),
@@ -431,7 +873,7 @@ def interview_prep_answer():
     if not answer:
         return jsonify({"error": "Please provide an answer."}), 400
 
-    interview = session.get("interview")
+    interview = _get_interview()
     if not interview or interview.get("report"):
         return jsonify({"error": "No active interview session."}), 400
 
@@ -473,20 +915,19 @@ def interview_prep_answer():
     else:
         response["next_question"] = questions[interview["current_index"]]
 
-    session["interview"] = interview
-    session.modified = True
+    _set_interview(interview)
     return jsonify(response)
 
 
 @app.route("/interview-prep/reset", methods=["POST"])
 def interview_prep_reset():
-    session.pop("interview", None)
+    _set_interview(None)
     return jsonify({"ok": True})
 
 
 def _require_resume_jd():
     resume_text = _get_resume_text()
-    jd_text = session.get("jd", "")
+    jd_text = _get_jd()
     if not resume_text or not jd_text:
         return None, None, "Upload a resume and job description via Resume Optimizer first."
     return resume_text, jd_text, None
@@ -495,7 +936,7 @@ def _require_resume_jd():
 @app.route("/documents")
 def documents():
     has_resume = bool(session.get("resume_filename"))
-    has_jd = bool(session.get("jd"))
+    has_jd = bool(_get_jd())
     return render_template(
         "documents.html",
         has_data=has_resume and has_jd,
@@ -513,6 +954,18 @@ def documents_cover_letter():
     data = request.get_json(silent=True) or {}
     tone = data.get("tone", "professional")
 
+    if use_async_jobs():
+        payload = {
+            "resume_text": resume_text,
+            "jd_text": jd_text,
+            "tone": tone,
+            "demo_mode": DEMO_MODE,
+            "upload_folder": app.config["UPLOAD_FOLDER"],
+            "store_id": get_store_id(),
+        }
+        job_id = get_job_manager().submit("cover_letter", payload, user_id=_user_id())
+        return jsonify({"job_id": job_id, "status": "queued"}), 202
+
     try:
         if DEMO_MODE:
             content = mock_cover_letter(resume_text, jd_text, tone)
@@ -521,8 +974,7 @@ def documents_cover_letter():
     except Exception as exc:
         return jsonify({"error": format_openai_error(exc)}), 500
 
-    session["documents_cover_letter"] = content
-    session.modified = True
+    _set_document("documents_cover_letter", content)
     return jsonify({"content": content, "tone": tone})
 
 
@@ -535,6 +987,18 @@ def documents_email():
     data = request.get_json(silent=True) or {}
     email_type = data.get("email_type", "job_application")
 
+    if use_async_jobs():
+        payload = {
+            "resume_text": resume_text,
+            "jd_text": jd_text,
+            "email_type": email_type,
+            "demo_mode": DEMO_MODE,
+            "upload_folder": app.config["UPLOAD_FOLDER"],
+            "store_id": get_store_id(),
+        }
+        job_id = get_job_manager().submit("email", payload, user_id=_user_id())
+        return jsonify({"job_id": job_id, "status": "queued"}), 202
+
     try:
         if DEMO_MODE:
             result = mock_email(resume_text, jd_text, email_type)
@@ -543,18 +1007,17 @@ def documents_email():
     except Exception as exc:
         return jsonify({"error": format_openai_error(exc)}), 500
 
-    session["documents_email"] = result
-    session.modified = True
+    _set_document("documents_email", result)
     return jsonify(result)
 
 
 @app.route("/documents/download/<kind>/<fmt>")
 def documents_download(kind, fmt):
     if kind == "cover_letter":
-        content = session.get("documents_cover_letter", "")
+        content = _get_document("documents_cover_letter", "")
         filename = "cover_letter"
     elif kind == "email":
-        email = session.get("documents_email", {})
+        email = _get_document("documents_email", {}) or {}
         content = f"Subject: {email.get('subject', '')}\n\n{email.get('body', '')}"
         filename = "professional_email"
     else:

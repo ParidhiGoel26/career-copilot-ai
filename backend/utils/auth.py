@@ -1,4 +1,4 @@
-"""JWT authentication and JSON user store."""
+"""JWT authentication with JSON file store or SQLAlchemy (USE_DATABASE flag)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ import jwt
 from flask import g, jsonify, redirect, request, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from utils.feature_flags import use_database
+
 USERS_FILE = Path(__file__).resolve().parent.parent / "data" / "users.json"
 TOKEN_COOKIE = "access_token"
 TOKEN_HOURS = 24
@@ -20,6 +22,12 @@ TOKEN_HOURS = 24
 
 def _jwt_secret() -> str:
     return os.getenv("JWT_SECRET_KEY") or os.getenv("FLASK_SECRET_KEY", "change-me-in-production")
+
+
+def _db_users():
+    from utils import db_users
+
+    return db_users
 
 
 def _load_users() -> dict:
@@ -37,6 +45,8 @@ def _save_users(data: dict) -> None:
 
 
 def find_user_by_email(email: str):
+    if use_database():
+        return _db_users().find_user_by_email(email)
     email = (email or "").strip().lower()
     for user in _load_users().get("users", []):
         if user.get("email") == email:
@@ -45,6 +55,8 @@ def find_user_by_email(email: str):
 
 
 def find_user_by_id(user_id: str):
+    if use_database():
+        return _db_users().find_user_by_id(user_id)
     for user in _load_users().get("users", []):
         if user.get("id") == user_id:
             return user
@@ -52,7 +64,10 @@ def find_user_by_id(user_id: str):
 
 
 def create_user(email: str, password: str, name: str = "") -> dict:
-    email = email.strip().lower()
+    if use_database():
+        return _db_users().create_user(email, password, name)
+
+    email = (email or "").strip().lower()
     if not email or not password:
         raise ValueError("Email and password are required.")
     if len(password) < 6:
@@ -74,6 +89,8 @@ def create_user(email: str, password: str, name: str = "") -> dict:
 
 
 def authenticate_user(email: str, password: str):
+    if use_database():
+        return _db_users().authenticate_user(email, password)
     user = find_user_by_email(email)
     if not user or not check_password_hash(user.get("password_hash", ""), password):
         return None
@@ -120,6 +137,10 @@ def get_token_from_request():
 
 
 def ensure_default_user():
+    """Create the default admin when no users exist (flag-aware; no blind init_db)."""
+    if use_database():
+        _db_users().ensure_default_user()
+        return
     if _load_users().get("users"):
         return
     email = os.getenv("DEFAULT_USER_EMAIL", "admin@careerai.local")
@@ -142,11 +163,14 @@ def login_required(view):
 
 
 PUBLIC_ENDPOINTS = frozenset({
+    "health",
+    "ready",
+    "metrics",
+    "static",
     "login",
     "register",
     "auth_login",
     "auth_register",
-    "static",
 })
 
 

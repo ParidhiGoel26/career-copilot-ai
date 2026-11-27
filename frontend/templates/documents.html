@@ -131,6 +131,7 @@
 {% endblock %}
 
 {% block extra_js %}
+<script src="{{ url_for('static', filename='js/jobs.js') }}"></script>
 <script>
   let selectedTone = 'professional';
   let selectedEmailType = 'job_application';
@@ -158,12 +159,22 @@
     btn.disabled = true;
     btn.textContent = 'Generating...';
 
-    const res = await fetch('{{ url_for("documents_cover_letter") }}', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tone: selectedTone }),
-    });
-    const data = await res.json();
+    let data;
+    try {
+      data = await fetchJsonMaybeAsync('{{ url_for("documents_cover_letter") }}', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tone: selectedTone }),
+        onStatus: (status) => {
+          btn.textContent = status === 'running' ? 'Generating...' : 'Queued...';
+        },
+      });
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'Generate Cover Letter';
+      alert(err.message || 'Request failed');
+      return;
+    }
     btn.disabled = false;
     btn.textContent = 'Generate Cover Letter';
 
@@ -177,12 +188,22 @@
     btn.disabled = true;
     btn.textContent = 'Generating...';
 
-    const res = await fetch('{{ url_for("documents_email") }}', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email_type: selectedEmailType }),
-    });
-    const data = await res.json();
+    let data;
+    try {
+      data = await fetchJsonMaybeAsync('{{ url_for("documents_email") }}', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email_type: selectedEmailType }),
+        onStatus: (status) => {
+          btn.textContent = status === 'running' ? 'Generating...' : 'Queued...';
+        },
+      });
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'Generate Email';
+      alert(err.message || 'Request failed');
+      return;
+    }
     btn.disabled = false;
     btn.textContent = 'Generate Email';
 

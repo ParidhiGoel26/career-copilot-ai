@@ -87,6 +87,7 @@
 {% endblock %}
 
 {% block extra_js %}
+<script src="{{ url_for('static', filename='js/jobs.js') }}"></script>
 <script>
   const chatMessages = document.getElementById('chatMessages');
   const chatInput = document.getElementById('chatInput');
@@ -147,12 +148,15 @@
     showTyping();
 
     try {
-      const res = await fetch('{{ url_for("career_coach_chat_api") }}', {
+      const data = await fetchJsonMaybeAsync('{{ url_for("career_coach_chat_api") }}', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message }),
+        onStatus: (status) => {
+          const el = document.getElementById('typing');
+          if (el) el.textContent = status === 'running' ? 'Coach is thinking...' : 'Queued...';
+        },
       });
-      const data = await res.json();
       hideTyping();
       if (data.error && !data.reply) {
         appendBubble('assistant', 'Error: ' + data.error);
@@ -161,7 +165,7 @@
       }
     } catch (err) {
       hideTyping();
-      appendBubble('assistant', 'Network error. Please try again.');
+      appendBubble('assistant', 'Error: ' + (err.message || 'Network error. Please try again.'));
     }
     sendBtn.disabled = false;
     chatInput.focus();

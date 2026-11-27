@@ -7,3 +7,4 @@ backend/uploads/*
 backend/data/users.json
 backend/data/user_activity/*
 !backend/data/.gitkeep
+backend/data/*.db

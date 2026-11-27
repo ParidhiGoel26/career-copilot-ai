@@ -45,6 +45,10 @@ Most tools share resume and JD data from the Resume Optimizer flow. Complete tha
 ## Tech Stack
 
 - **Backend:** Python 3, Flask, Groq API (OpenAI-compatible client)
+- **Storage:** JSON files by default; SQLAlchemy (SQLite / Postgres) behind `USE_DATABASE`
+- **RAG:** TF-IDF by default; embedding retrieval (cached in DB) behind `USE_EMBEDDINGS`
+- **Async jobs:** thread pool or Redis + RQ behind `USE_ASYNC_JOBS`
+- **Ops:** `/health`, `/ready`, `/metrics`, request-id logging, Dockerfile / docker-compose, pytest suite
 - **Frontend:** Jinja2 templates, HTML/CSS
 - **PDF:** pdfplumber (parsing), ReportLab (export)
 
@@ -150,8 +154,22 @@ resume_optimizer/
 | `GROQ_MODEL` | No | Model id (default: `llama-3.3-70b-versatile`) |
 | `FLASK_SECRET_KEY` | No | Flask session secret (defaults to a dev value) |
 | `DEMO_MODE` | No | `true` to enable mock AI responses |
+| `USE_DATABASE` | No | `true` to store users/history in SQL (`DATABASE_URL`, default SQLite `backend/data/career_ai.db`) |
+| `USE_EMBEDDINGS` | No | `true` to use embedding similarity for RAG (`EMBEDDING_PROVIDER=hashing\|api`) |
+| `USE_ASYNC_JOBS` | No | `true` to return `202 + job_id` for coach / cover letter / email; poll `GET /jobs/<id>` |
+| `JOB_BACKEND` | No | `memory` (default) or `redis` |
+| `REDIS_URL` | No | Redis URL for the `redis` job backend |
 
 \*Not required when `DEMO_MODE=true`.
+
+## Testing
+
+```bash
+cd backend
+..\venv\Scripts\python.exe -m pytest tests -q
+```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the request flow, data model and deployment notes.
 
 ## Troubleshooting
 
@@ -184,7 +202,6 @@ Wait a moment and retry, or set `DEMO_MODE=true` in `.env` and restart the serve
 ## Roadmap
 
 - Integrations (LinkedIn, Indeed, etc.)
-- Settings page
 - Live GitHub / LeetCode API integration
 - Voice recording for interview answers
 

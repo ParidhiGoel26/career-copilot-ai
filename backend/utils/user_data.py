@@ -1,4 +1,7 @@
-"""Per-user storage for uploaded resumes and job-description searches."""
+"""Per-user storage for uploaded resumes and job-description searches.
+
+Dispatches to JSON files (default) or utils.db_history when USE_DATABASE is on.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +11,8 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from utils.feature_flags import use_database
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "user_activity"
 
@@ -63,7 +68,7 @@ def _jd_title(jd_text: str) -> str:
     return first_line or "Job description"
 
 
-def save_resume_record(user_id: str, stored_filename: str, original_filename: str) -> dict:
+def _file_save_resume_record(user_id: str, stored_filename: str, original_filename: str) -> dict:
     profile = _load_profile(user_id)
     record = {
         "id": uuid.uuid4().hex,
@@ -77,7 +82,7 @@ def save_resume_record(user_id: str, stored_filename: str, original_filename: st
     return record
 
 
-def log_job_search(
+def _file_log_job_search(
     user_id: str,
     jd_text: str,
     *,
@@ -105,7 +110,7 @@ def log_job_search(
     return record
 
 
-def update_job_search(user_id: str, search_id: str, **fields) -> dict | None:
+def _file_update_job_search(user_id: str, search_id: str, **fields) -> dict | None:
     profile = _load_profile(user_id)
     for item in profile["searches"]:
         if item.get("id") == search_id:
@@ -116,7 +121,7 @@ def update_job_search(user_id: str, search_id: str, **fields) -> dict | None:
     return None
 
 
-def log_coach_query(user_id: str, message: str) -> None:
+def _file_log_coach_query(user_id: str, message: str) -> None:
     profile = _load_profile(user_id)
     profile["coach_queries"].insert(0, {
         "id": uuid.uuid4().hex,
@@ -127,25 +132,25 @@ def log_coach_query(user_id: str, message: str) -> None:
     _save_profile(user_id, profile)
 
 
-def get_user_history(user_id: str) -> dict:
+def _file_get_user_history(user_id: str) -> dict:
     return _load_profile(user_id)
 
 
-def find_resume(user_id: str, resume_id: str) -> dict | None:
+def _file_find_resume(user_id: str, resume_id: str) -> dict | None:
     for item in _load_profile(user_id).get("resumes", []):
         if item.get("id") == resume_id:
             return item
     return None
 
 
-def find_search(user_id: str, search_id: str) -> dict | None:
+def _file_find_search(user_id: str, search_id: str) -> dict | None:
     for item in _load_profile(user_id).get("searches", []):
         if item.get("id") == search_id:
             return item
     return None
 
 
-def delete_resume(user_id: str, resume_id: str, user_upload_dir: str) -> bool:
+def _file_delete_resume(user_id: str, resume_id: str, user_upload_dir: str) -> bool:
     profile = _load_profile(user_id)
     record = None
     remaining = []
@@ -174,7 +179,7 @@ def delete_resume(user_id: str, resume_id: str, user_upload_dir: str) -> bool:
     return True
 
 
-def delete_search(user_id: str, search_id: str) -> bool:
+def _file_delete_search(user_id: str, search_id: str) -> bool:
     profile = _load_profile(user_id)
     before = len(profile.get("searches", []))
     profile["searches"] = [
@@ -196,3 +201,64 @@ def store_uploaded_file(file_storage, user_upload_dir: str, original_filename: s
     full_path = os.path.join(user_upload_dir, stored)
     file_storage.save(full_path)
     return stored, full_path
+
+
+def _db():
+    from utils import db_history
+
+    return db_history
+
+
+def save_resume_record(user_id: str, stored_filename: str, original_filename: str) -> dict:
+    if use_database():
+        return _db().save_resume_record(user_id, stored_filename, original_filename)
+    return _file_save_resume_record(user_id, stored_filename, original_filename)
+
+
+def log_job_search(user_id: str, jd_text: str, *, resume_id: str | None = None, tool: str = "resume_optimizer", extra: dict | None = None) -> dict:
+    if use_database():
+        return _db().log_job_search(user_id, jd_text, resume_id=resume_id, tool=tool, extra=extra)
+    return _file_log_job_search(user_id, jd_text, resume_id=resume_id, tool=tool, extra=extra)
+
+
+def update_job_search(user_id: str, search_id: str, **fields) -> dict | None:
+    if use_database():
+        return _db().update_job_search(user_id, search_id, **fields)
+    return _file_update_job_search(user_id, search_id, **fields)
+
+
+def log_coach_query(user_id: str, message: str) -> None:
+    if use_database():
+        return _db().log_coach_query(user_id, message)
+    return _file_log_coach_query(user_id, message)
+
+
+def get_user_history(user_id: str) -> dict:
+    if use_database():
+        return _db().get_user_history(user_id)
+    return _file_get_user_history(user_id)
+
+
+def find_resume(user_id: str, resume_id: str) -> dict | None:
+    if use_database():
+        return _db().find_resume(user_id, resume_id)
+    return _file_find_resume(user_id, resume_id)
+
+
+def find_search(user_id: str, search_id: str) -> dict | None:
+    if use_database():
+        return _db().find_search(user_id, search_id)
+    return _file_find_search(user_id, search_id)
+
+
+def delete_resume(user_id: str, resume_id: str, user_upload_dir: str) -> bool:
+    if use_database():
+        return _db().delete_resume(user_id, resume_id, user_upload_dir)
+    return _file_delete_resume(user_id, resume_id, user_upload_dir)
+
+
+def delete_search(user_id: str, search_id: str) -> bool:
+    if use_database():
+        return _db().delete_search(user_id, search_id)
+    return _file_delete_search(user_id, search_id)
+

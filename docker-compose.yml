@@ -1,0 +1,71 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: careerai
+      POSTGRES_PASSWORD: careerai
+      POSTGRES_DB: careerai
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U careerai -d careerai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  web:
+    build: .
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://careerai:careerai@db:5432/careerai
+      REDIS_URL: redis://redis:6379/0
+      USE_DATABASE: "true"
+      USE_ASYNC_JOBS: "true"
+      JOB_BACKEND: redis
+      DEMO_MODE: ${DEMO_MODE:-true}
+    volumes:
+      - uploads:/app/backend/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["python", "-m", "utils.worker"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://careerai:careerai@db:5432/careerai
+      REDIS_URL: redis://redis:6379/0
+      USE_DATABASE: "true"
+      USE_ASYNC_JOBS: "true"
+      JOB_BACKEND: redis
+      DEMO_MODE: ${DEMO_MODE:-true}
+    volumes:
+      - uploads:/app/backend/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  uploads:

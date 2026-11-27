@@ -28,7 +28,18 @@ from utils.interview_report import mock_evaluate_answer, generate_interview_repo
 from utils.cover_letter import generate_cover_letter, mock_cover_letter
 from utils.email_generator import generate_email, mock_email
 from utils.llm_config import GROQ_BASE_URL
-from utils.session_store import save_json, load_json, save_text, load_text, delete_blob
+from utils.session_store import (
+    save_json,
+    load_json,
+    save_text,
+    load_text,
+    delete_blob,
+    get_store_id,
+)
+from utils.feature_flags import use_async_jobs, use_database
+from utils.jobs import get_job_manager
+from utils.observability import register_observability
+from utils import metrics as app_metrics
 from utils.auth import (
     TOKEN_COOKIE,
     TOKEN_HOURS,
@@ -83,6 +94,7 @@ os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
 ensure_default_user()
 register_auth_hooks(app)
+register_observability(app)
 
 
 def _set_auth_cookie(response, token: str):
@@ -237,6 +249,10 @@ def _get_document(name, default=None):
 
 NAV_MAP = {
     "dashboard": "dashboard",
+    "health": "",
+    "ready": "",
+    "metrics": "",
+    "job_status": "",
     "login": "",
     "register": "",
     "auth_login": "",
@@ -270,6 +286,43 @@ def inject_nav():
         "demo_mode": DEMO_MODE,
         "current_user": getattr(g, "current_user", None),
     }
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+@app.route("/ready")
+def ready():
+    checks = {"database": "skipped"}
+    if use_database():
+        try:
+            from sqlalchemy import text
+            from utils.db import get_session
+
+            db = get_session()
+            try:
+                db.execute(text("SELECT 1"))
+            finally:
+                db.close()
+            checks["database"] = "ok"
+        except Exception as exc:
+            return jsonify({"status": "not_ready", "checks": {"database": str(exc)}}), 503
+    return jsonify({"status": "ready", "checks": checks})
+
+
+@app.route("/metrics")
+def metrics():
+    return jsonify(app_metrics.snapshot())
+
+
+@app.route("/jobs/<job_id>")
+def job_status(job_id):
+    job = get_job_manager().get(job_id, user_id=_user_id())
+    if not job:
+        return jsonify({"error": "Job not found."}), 404
+    return jsonify(job.to_dict())
 
 
 @app.route("/login")
@@ -638,6 +691,23 @@ def career_coach_chat_api():
 
     log_coach_query(_user_id(), message)
 
+    if use_async_jobs():
+        payload = {
+            "message": message,
+            "upload_folder": app.config["UPLOAD_FOLDER"],
+            "store_id": get_store_id(),
+            "user_id": _user_id(),
+            "demo_mode": DEMO_MODE,
+            "chat_history": _get_coach_chat(),
+            "session_data": {
+                "resume_filename": session.get("resume_filename"),
+                "github_username": session.get("github_username"),
+                "leetcode_username": session.get("leetcode_username"),
+            },
+        }
+        job_id = get_job_manager().submit("career_coach", payload, user_id=_user_id())
+        return jsonify({"job_id": job_id, "status": "queued"}), 202
+
     kb, _, chat_history = _get_coach_context()
     retrieved = kb.retrieve(message, top_k=6)
     api_error = None
@@ -884,6 +954,18 @@ def documents_cover_letter():
     data = request.get_json(silent=True) or {}
     tone = data.get("tone", "professional")
 
+    if use_async_jobs():
+        payload = {
+            "resume_text": resume_text,
+            "jd_text": jd_text,
+            "tone": tone,
+            "demo_mode": DEMO_MODE,
+            "upload_folder": app.config["UPLOAD_FOLDER"],
+            "store_id": get_store_id(),
+        }
+        job_id = get_job_manager().submit("cover_letter", payload, user_id=_user_id())
+        return jsonify({"job_id": job_id, "status": "queued"}), 202
+
     try:
         if DEMO_MODE:
             content = mock_cover_letter(resume_text, jd_text, tone)
@@ -904,6 +986,18 @@ def documents_email():
 
     data = request.get_json(silent=True) or {}
     email_type = data.get("email_type", "job_application")
+
+    if use_async_jobs():
+        payload = {
+            "resume_text": resume_text,
+            "jd_text": jd_text,
+            "email_type": email_type,
+            "demo_mode": DEMO_MODE,
+            "upload_folder": app.config["UPLOAD_FOLDER"],
+            "store_id": get_store_id(),
+        }
+        job_id = get_job_manager().submit("email", payload, user_id=_user_id())
+        return jsonify({"job_id": job_id, "status": "queued"}), 202
 
     try:
         if DEMO_MODE:

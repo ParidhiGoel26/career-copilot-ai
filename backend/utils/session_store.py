@@ -13,7 +13,7 @@ import os
 import uuid
 from pathlib import Path
 
-from flask import session
+from flask import has_request_context, session
 
 
 def _base_dir(upload_folder: str) -> Path:
@@ -23,6 +23,12 @@ def _base_dir(upload_folder: str) -> Path:
 
 
 def get_store_id() -> str:
+    """Return the request's store id (creates one in the cookie session).
+
+    Outside a request (workers/tests) callers must pass store_id explicitly.
+    """
+    if not has_request_context():
+        raise RuntimeError("store_id is required outside a request context")
     store_id = session.get("_store_id")
     if not store_id:
         store_id = uuid.uuid4().hex
@@ -31,20 +37,23 @@ def get_store_id() -> str:
     return store_id
 
 
-def _blob_path(upload_folder: str, name: str, ext: str) -> Path:
-    store_dir = _base_dir(upload_folder) / get_store_id()
+def _blob_path(upload_folder: str, name: str, ext: str, store_id: str | None = None) -> Path:
+    sid = store_id or get_store_id()
+    store_dir = _base_dir(upload_folder) / "".join(
+        c for c in sid if c.isalnum() or c in ("_", "-")
+    )
     store_dir.mkdir(parents=True, exist_ok=True)
     safe = "".join(c for c in name if c.isalnum() or c in ("_", "-"))
     return store_dir / f"{safe}.{ext}"
 
 
-def save_json(upload_folder: str, name: str, data) -> None:
-    path = _blob_path(upload_folder, name, "json")
+def save_json(upload_folder: str, name: str, data, store_id: str | None = None) -> None:
+    path = _blob_path(upload_folder, name, "json", store_id)
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
-def load_json(upload_folder: str, name: str, default=None):
-    path = _blob_path(upload_folder, name, "json")
+def load_json(upload_folder: str, name: str, default=None, store_id: str | None = None):
+    path = _blob_path(upload_folder, name, "json", store_id)
     if not path.exists():
         return default
     try:
@@ -53,13 +62,13 @@ def load_json(upload_folder: str, name: str, default=None):
         return default
 
 
-def save_text(upload_folder: str, name: str, text: str) -> None:
-    path = _blob_path(upload_folder, name, "txt")
+def save_text(upload_folder: str, name: str, text: str, store_id: str | None = None) -> None:
+    path = _blob_path(upload_folder, name, "txt", store_id)
     path.write_text(text or "", encoding="utf-8")
 
 
-def load_text(upload_folder: str, name: str, default: str = "") -> str:
-    path = _blob_path(upload_folder, name, "txt")
+def load_text(upload_folder: str, name: str, default: str = "", store_id: str | None = None) -> str:
+    path = _blob_path(upload_folder, name, "txt", store_id)
     if not path.exists():
         return default
     try:
@@ -68,9 +77,9 @@ def load_text(upload_folder: str, name: str, default: str = "") -> str:
         return default
 
 
-def delete_blob(upload_folder: str, name: str) -> None:
+def delete_blob(upload_folder: str, name: str, store_id: str | None = None) -> None:
     for ext in ("json", "txt"):
-        path = _blob_path(upload_folder, name, ext)
+        path = _blob_path(upload_folder, name, ext, store_id)
         if path.exists():
             try:
                 os.remove(path)
